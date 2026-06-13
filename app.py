@@ -95,22 +95,138 @@ PROFILE_PARAMS = {
 }
 
 
-def choose_number_of_shots(total_weight: float, available_weights: list[float], water_type: str) -> int:
-    """Stima un numero di pallini pratico in base al peso medio disponibile e al profilo acqua."""
+def choose_number_of_shots(total_weight: float, available_weights: list[float], water_type: str, min_n: int = 3) -> int:
+    """Stima un numero di pallini pratico, garantendo almeno una unità per ogni taglia selezionata."""
     if not available_weights:
         return 0
     median_weight = float(np.median(available_weights))
     base_n = int(round(total_weight / median_weight)) if median_weight > 0 else 8
     profile_n = PROFILE_PARAMS[water_type]["n_factor"]
-    # Blend tra peso richiesto e profilo: evita risultati troppo estremi.
     n = int(round((base_n * 0.55) + (profile_n * 0.45)))
-    return max(3, min(36, n))
+    return max(min_n, min(50, n))
+
+
+def allocate_counts(shots: dict[str, float], n: int, water_type: str) -> dict[str, int]:
+    """
+    Distribuisce il numero totale di pallini tra tutte le taglie selezionate.
+    Ogni taglia selezionata viene sempre usata almeno una volta.
+
+    Ordine logico: pallini più pesanti verso il galleggiante, più leggeri verso l'amo.
+    La tipologia di acqua modifica la quantità relativa:
+    - acqua ferma: più pallini piccoli e distribuzione morbida;
+    - corrente lenta: quasi equa, leggermente più piccoli;
+    - corrente media: equilibrata;
+    - corrente veloce: più pallini grandi e portanti.
+    """
+    ordered = sorted(shots.items(), key=lambda kv: kv[1], reverse=True)
+    k = len(ordered)
+    n = max(n, k)
+
+    counts = {tag: 1 for tag, _ in ordered}
+    extra = n - k
+    if extra == 0:
+        return counts
+
+    # Da 1 per i più pesanti a 0 per i più leggeri.
+    rank_heavy_to_light = np.linspace(1, 0, k)
+
+    if water_type == "Acqua ferma":
+        # Favorisce i piccoli vicino all'amo.
+        weights = 0.55 + (1 - rank_heavy_to_light) * 1.45
+    elif water_type == "Corrente lenta":
+        weights = 0.80 + (1 - rank_heavy_to_light) * 0.70
+    elif water_type == "Corrente media":
+        weights = np.ones(k)
+    else:  # Corrente veloce
+        # Favorisce i grandi verso il galleggiante.
+        weights = 0.55 + rank_heavy_to_light * 1.45
+
+    raw = weights / weights.sum() * extra
+    floors = np.floor(raw).astype(int)
+    remainders = raw - floors
+
+    for (tag, _), add in zip(ordered, floors):
+        counts[tag] += int(add)
+
+    missing = extra - int(floors.sum())
+    for idx in np.argsort(-remainders)[:missing]:
+        tag = ordered[int(idx)][0]
+        counts[tag] += 1
+
+    return counts
+
+
+def improve_counts_for_weight(counts: dict[str, int], shots: dict[str, float], target_weight: float, water_type: str, fixed_total: bool) -> dict[str, int]:
+    """
+    Avvicina il peso totale al target senza mai eliminare una taglia selezionata.
+    Se fixed_total=True mantiene invariato il numero totale di pallini, spostando quantità tra taglie.
+    Se fixed_total=False può aggiungere/togliere pallini, ma lascia almeno 1 per taglia.
+    """
+    ordered = sorted(shots.items(), key=lambda kv: kv[1], reverse=True)
+    tags = [t for t, _ in ordered]
+    weights = dict(ordered)
+    current = counts.copy()
+
+    def total(c):
+        return sum(c[t] * weights[t] for t in tags)
+
+    for _ in range(300):
+        current_error = abs(total(current) - target_weight)
+        best = None
+
+        if fixed_total:
+            # Prova a spostare 1 pallino da una taglia a un'altra, senza scendere sotto 1.
+            for src in tags:
+                if current[src] <= 1:
+                    continue
+                for dst in tags:
+                    if src == dst:
+                        continue
+                    trial = current.copy()
+                    trial[src] -= 1
+                    trial[dst] += 1
+                    err = abs(total(trial) - target_weight)
+                    if err + 1e-12 < current_error:
+                        best = trial
+                        current_error = err
+        else:
+            # Prova aggiunte e rimozioni singole.
+            for tag in tags:
+                trial = current.copy()
+                trial[tag] += 1
+                err = abs(total(trial) - target_weight)
+                if err + 1e-12 < current_error:
+                    best = trial
+                    current_error = err
+
+                if current[tag] > 1:
+                    trial = current.copy()
+                    trial[tag] -= 1
+                    err = abs(total(trial) - target_weight)
+                    if err + 1e-12 < current_error:
+                        best = trial
+                        current_error = err
+
+        if best is None:
+            break
+        current = best
+
+    return current
+
+
+def expand_counts_to_sequence(counts: dict[str, int], shots: dict[str, float]) -> list[tuple[str, float]]:
+    """Espande i conteggi in sequenza dal galleggiante all'amo: peso decrescente."""
+    ordered = sorted(shots.items(), key=lambda kv: kv[1], reverse=True)
+    selected = []
+    for tag, weight in ordered:
+        selected.extend([(tag, weight)] * counts[tag])
+    return selected
 
 
 def build_weight_targets(total_weight: float, n: int, water_type: str) -> np.ndarray:
     """
+    Funzione lasciata per eventuali versioni future.
     Crea target di peso dal galleggiante all'amo.
-    In alto più peso, scendendo verso l'amo pallini più leggeri.
     """
     power = PROFILE_PARAMS[water_type]["weight_power"]
     x = np.linspace(1.0, 0.25, n) ** power
@@ -119,7 +235,7 @@ def build_weight_targets(total_weight: float, n: int, water_type: str) -> np.nda
 
 
 def nearest_available_shots(targets: np.ndarray, shots: dict[str, float]) -> list[tuple[str, float]]:
-    """Associa ogni peso target al pallino disponibile più vicino."""
+    """Funzione lasciata per eventuali versioni future."""
     items = sorted(shots.items(), key=lambda kv: kv[1], reverse=True)
     result = []
     for t in targets:
@@ -129,44 +245,10 @@ def nearest_available_shots(targets: np.ndarray, shots: dict[str, float]) -> lis
 
 
 def improve_total_weight(selected: list[tuple[str, float]], shots: dict[str, float], target_weight: float) -> list[tuple[str, float]]:
-    """Piccola ottimizzazione greedy per avvicinare il peso totale al target."""
+    """Funzione lasciata per eventuali versioni future."""
     if not selected:
         return selected
-
-    ordered = sorted(shots.items(), key=lambda kv: kv[1])
-    by_tag = {tag: idx for idx, (tag, _) in enumerate(ordered)}
-    current = selected[:]
-
-    for _ in range(120):
-        current_sum = sum(w for _, w in current)
-        current_error = abs(current_sum - target_weight)
-        best = None
-
-        for i, (tag, w) in enumerate(current):
-            idx = by_tag[tag]
-            candidate_indices = []
-            if current_sum < target_weight and idx < len(ordered) - 1:
-                candidate_indices.append(idx + 1)
-            if current_sum > target_weight and idx > 0:
-                candidate_indices.append(idx - 1)
-
-            for new_idx in candidate_indices:
-                new_tag, new_w = ordered[new_idx]
-                trial = current[:]
-                trial[i] = (new_tag, new_w)
-                trial_sum = sum(x[1] for x in trial)
-                trial_error = abs(trial_sum - target_weight)
-                if trial_error < current_error:
-                    best = (trial_error, i, new_tag, new_w)
-                    current_error = trial_error
-
-        if best is None:
-            break
-        _, i, new_tag, new_w = best
-        current[i] = (new_tag, new_w)
-
-    # Riordino finale: dal galleggiante all'amo peso decrescente.
-    return sorted(current, key=lambda kv: kv[1], reverse=True)
+    return sorted(selected, key=lambda kv: kv[1], reverse=True)
 
 
 def calculate_positions(length_cm: float, n: int, water_type: str) -> tuple[np.ndarray, np.ndarray]:
@@ -186,10 +268,18 @@ def calculate_positions(length_cm: float, n: int, water_type: str) -> tuple[np.n
 
 def make_plan(length_cm: float, total_weight: float, water_type: str, shots: dict[str, float], manual_n: int | None):
     available_weights = list(shots.values())
-    n = manual_n if manual_n is not None else choose_number_of_shots(total_weight, available_weights, water_type)
-    targets = build_weight_targets(total_weight, n, water_type)
-    selected = nearest_available_shots(targets, shots)
-    selected = improve_total_weight(selected, shots, total_weight)
+    min_n = len(shots)
+    fixed_total = manual_n is not None
+
+    if fixed_total:
+        n = max(manual_n, min_n)
+    else:
+        n = choose_number_of_shots(total_weight, available_weights, water_type, min_n=min_n)
+
+    counts = allocate_counts(shots, n, water_type)
+    counts = improve_counts_for_weight(counts, shots, total_weight, water_type, fixed_total=fixed_total)
+    selected = expand_counts_to_sequence(counts, shots)
+
     positions, distances = calculate_positions(length_cm, len(selected), water_type)
 
     rows = []
@@ -253,7 +343,7 @@ with st.container(border=True):
 
 with st.container(border=True):
     st.subheader("2. Pallini disponibili")
-    st.caption("Seleziona le misure che hai nella scatola. I pesi sono indicativi.")
+    st.caption("Seleziona le misure che vuoi usare: SPALLO userà sempre almeno un pallino per ogni misura selezionata.")
 
     default_selected = {"N.11", "N.10", "N.9", "N.8", "N.7", "N.6"}
     selected_tags = []
@@ -276,7 +366,8 @@ with st.expander("Opzioni avanzate"):
     use_manual_n = st.toggle("Imposta manualmente il numero di pallini", value=False)
     manual_n = None
     if use_manual_n:
-        manual_n = st.slider("Numero pallini", min_value=3, max_value=40, value=14)
+        min_manual = max(3, len(selected_tags)) if selected_tags else 3
+        manual_n = st.slider("Numero pallini", min_value=min_manual, max_value=50, value=max(14, min_manual))
 
 calculate = st.button("Genera spallinata")
 
@@ -322,4 +413,4 @@ else:
     st.info("Inserisci i parametri e genera la prima spallinata.")
 
 st.markdown("---")
-st.caption("SPALLO · versione prova. Logica: peso decrescente e distanze crescenti dal galleggiante verso l'amo.")
+st.caption("SPALLO · versione prova v2. Usa sempre tutte le taglie selezionate; peso decrescente e distanze crescenti dal galleggiante verso l'amo.")
